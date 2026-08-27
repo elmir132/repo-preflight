@@ -1,0 +1,14 @@
+[project]
+name = "repo-preflight"
+version = "0.1.0"
+description = "Check a git repository for secrets, personal data and suspicious commit dates before you publish it."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+preflight = "preflight:main"
+
+[tool.setuptools]
+py-modules = ["preflight"]
