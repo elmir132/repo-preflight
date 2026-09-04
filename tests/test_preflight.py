@@ -218,6 +218,17 @@ class FileAndHygieneTests(PreflightCase):
         for expected in ("no README", "no LICENSE", "no .gitignore", "no CI workflow"):
             self.assertTrue(any(m.startswith(expected) for m in messages), expected)
 
+    def test_a_preflightignore_file_skips_files_and_allows_comments(self):
+        self.repo.clean_base()
+        self.repo.write(".preflightignore", "# test fixtures hold fake numbers on purpose\n\ntests/*\n")
+        self.repo.write("tests/fixture.txt", f"{AWS}\n")
+        self.repo.write("real.txt", f"{AWS}\n")
+        self.repo.commit("ignore file")
+        paths = [f["path"] for f in self.repo.report()["findings"] if f["check"] == "secret"]
+        self.assertEqual(paths, ["real.txt"])
+        self.assertEqual(pf.read_ignore_file(self.repo.dir), ["tests/*"])
+        self.assertEqual(pf.read_ignore_file(tempfile.gettempdir() + "/no-such-folder"), [])
+
     def test_ignore_globs_skip_files(self):
         self.repo.clean_base()
         self.repo.write("tests/fixtures/sample.txt", f"{AWS}\n")

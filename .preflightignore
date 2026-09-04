@@ -1,0 +1,3 @@
+# The tests contain public example numbers (a documentation IBAN, a standard test card, a
+# 555 phone number) on purpose, to check that the detectors fire.
+tests/*

@@ -293,12 +293,23 @@ def hygiene_findings(root, paths):
     return findings
 
 
+def read_ignore_file(top):
+    """Patterns from a .preflightignore file in the repository root: one glob per line,
+    blank lines and lines starting with # are skipped."""
+    try:
+        with open(os.path.join(top, ".preflightignore"), encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")]
+    except OSError:
+        return []
+
+
 def run(root, history=False, pii=True, dates=True, ignore=(), now=None):
     root = os.path.abspath(root)
     try:
         top = git(root, "rev-parse", "--show-toplevel").decode().strip()
     except PreflightError:
         raise PreflightError(f"{root} is not inside a git repository")
+    ignore = list(ignore) + read_ignore_file(top)
     paths = [p for p in git(top, "ls-files", "-z").decode("utf-8", "replace").split("\x00") if p]
     findings = file_findings(top, paths, pii, ignore) + hygiene_findings(top, paths)
     if history:
