@@ -7,6 +7,8 @@ It only reads your repository; the one thing it can write is a pre-push hook, an
 you ask for it with --install-hook.
 """
 import argparse
+import csv
+import hashlib
 import json
 import math
 import os
@@ -17,7 +19,7 @@ import sys
 import time
 from collections import defaultdict
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 LEVELS = {"info": 0, "warn": 1, "error": 2}
 MAX_TEXT_BYTES = 2 * 1024 * 1024
@@ -293,6 +295,246 @@ def hygiene_findings(root, paths):
     return findings
 
 
+def _research_path(root, value, label):
+    """Resolve a manifest path while keeping it inside the repository."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty relative path")
+    if os.path.isabs(value):
+        raise ValueError(f"{label} must be a relative path inside the repository")
+    root_real = os.path.realpath(root)
+    full = os.path.realpath(os.path.join(root_real, value))
+    try:
+        inside = os.path.commonpath((root_real, full)) == root_real
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError(f"{label} points outside the repository")
+    return full, os.path.relpath(full, root_real).replace(os.sep, "/")
+
+
+def _research_read_json(root, value, label):
+    full, relative = _research_path(root, value, label)
+    try:
+        with open(full, "r", encoding="utf-8") as handle:
+            return json.load(handle), relative
+    except OSError as err:
+        raise ValueError(f"cannot read {label} '{relative}': {err.strerror or err}")
+    except (UnicodeError, json.JSONDecodeError) as err:
+        raise ValueError(f"{label} '{relative}' is not valid UTF-8 JSON: {err}")
+
+
+def research_findings(root, manifest_path=".research-evidence.json"):
+    """Check declared research artifacts without running code or contacting a service.
+
+    Manifest paths are confined to the repository. Supported sections are dataset,
+    model, citation and evaluation; each section is optional.
+    """
+    findings = []
+    try:
+        manifest, manifest_rel = _research_read_json(root, manifest_path, "manifest")
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must contain a JSON object")
+        if type(manifest.get("version")) is not int or manifest.get("version") != 1:
+            raise ValueError("manifest version must be 1")
+        sections = ("dataset", "model", "citation", "evaluation")
+        if not any(key in manifest for key in sections):
+            raise ValueError("manifest must define at least one of dataset, model, citation or evaluation")
+        findings.append(finding("info", "research-manifest", "loaded research evidence manifest", path=manifest_rel))
+    except ValueError as err:
+        return [finding("error", "research-manifest", str(err), path=manifest_path if isinstance(manifest_path, str) else None)]
+
+    def section(name):
+        if name not in manifest:
+            return None
+        value = manifest[name]
+        if not isinstance(value, dict):
+            findings.append(finding("error", "research-manifest", f"'{name}' must be an object", path=manifest_rel))
+            return None
+        return value
+
+    def artifact_path(config, field, label):
+        try:
+            full, relative = _research_path(root, config.get(field), f"{label}.{field}")
+        except ValueError as err:
+            findings.append(finding("error", "research-manifest", str(err), path=manifest_rel))
+            return None, None
+        if not os.path.isfile(full):
+            findings.append(finding("error", "research-artifact", f"{label} file does not exist", path=relative))
+            return None, relative
+        findings.append(finding("info", "research-artifact", f"{label} file is present", path=relative))
+        return full, relative
+
+    dataset = section("dataset")
+    if dataset is not None:
+        full, relative = artifact_path(dataset, "path", "dataset")
+        if full:
+            try:
+                with open(full, "r", encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.reader(handle)
+                    header = next(reader, None)
+                    if header is None:
+                        raise ValueError("CSV is empty")
+                    row_count = 0
+                    malformed_count = 0
+                    malformed_lines = []
+                    for row_number, row in enumerate(reader, 2):
+                        row_count += 1
+                        if len(row) != len(header):
+                            malformed_count += 1
+                            if len(malformed_lines) < 5:
+                                malformed_lines.append(row_number)
+                if malformed_count:
+                    findings.append(finding("error", "research-dataset",
+                                            f"{malformed_count} row(s) have a different number of fields; first at line(s) " + ", ".join(map(str, malformed_lines)), path=relative))
+                if "rows" in dataset:
+                    expected = dataset["rows"]
+                    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+                        raise ValueError("dataset.rows must be a non-negative integer")
+                    if row_count != expected:
+                        findings.append(finding("error", "research-dataset", f"expected {expected} data rows, found {row_count}", path=relative))
+                    else:
+                        findings.append(finding("info", "research-dataset", f"data row count matches ({row_count})", path=relative))
+                if "columns" in dataset:
+                    expected = dataset["columns"]
+                    if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+                        raise ValueError("dataset.columns must be a positive integer")
+                    if len(header) != expected:
+                        findings.append(finding("error", "research-dataset", f"expected {expected} columns, found {len(header)}", path=relative))
+                    else:
+                        findings.append(finding("info", "research-dataset", f"column count matches ({len(header)})", path=relative))
+                required = dataset.get("required_columns", [])
+                if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+                    raise ValueError("dataset.required_columns must be an array of column names")
+                missing = [name for name in required if name not in header]
+                if missing:
+                    findings.append(finding("error", "research-dataset", "required column(s) missing: " + ", ".join(missing), path=relative))
+                elif required:
+                    findings.append(finding("info", "research-dataset", "all required columns are present", path=relative))
+            except (OSError, UnicodeError, ValueError, csv.Error) as err:
+                findings.append(finding("error", "research-dataset", f"cannot validate dataset: {err}", path=relative))
+
+    model = section("model")
+    if model is not None:
+        full, relative = artifact_path(model, "path", "model")
+        if full:
+            max_bytes = model.get("max_bytes")
+            if max_bytes is not None:
+                if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+                    findings.append(finding("error", "research-manifest", "model.max_bytes must be a positive integer", path=manifest_rel))
+                else:
+                    try:
+                        size = os.path.getsize(full)
+                    except OSError as err:
+                        findings.append(finding("error", "research-model", f"cannot read model size: {err}", path=relative))
+                    else:
+                        level = "error" if size > max_bytes else "info"
+                        message = f"model is {size} bytes; maximum is {max_bytes} bytes" if size > max_bytes else f"model size is within limit ({size}/{max_bytes} bytes)"
+                        findings.append(finding(level, "research-model", message, path=relative))
+            expected_hash = model.get("sha256")
+            if expected_hash is not None:
+                if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                    findings.append(finding("error", "research-manifest", "model.sha256 must be a 64-character hexadecimal SHA-256", path=manifest_rel))
+                else:
+                    try:
+                        digest = hashlib.sha256()
+                        with open(full, "rb") as handle:
+                            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        actual_hash = digest.hexdigest()
+                        matches = actual_hash.lower() == expected_hash.lower()
+                        findings.append(finding("info" if matches else "error", "research-model",
+                                                "SHA-256 matches manifest" if matches else "SHA-256 does not match manifest", path=relative))
+                    except OSError as err:
+                        findings.append(finding("error", "research-model", f"cannot read model for SHA-256: {err}", path=relative))
+
+    citation = section("citation")
+    if citation is not None:
+        full, relative = artifact_path(citation, "path", "citation")
+        if full:
+            required = citation.get("required_fields", [])
+            if not isinstance(required, list) or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", item) for item in required):
+                findings.append(finding("error", "research-manifest", "citation.required_fields must be an array of field names", path=manifest_rel))
+            else:
+                try:
+                    with open(full, "r", encoding="utf-8") as handle:
+                        text = handle.read()
+                    missing = [name for name in required if not re.search(r"(?m)^\s*" + re.escape(name) + r"\s*:", text)]
+                    if missing:
+                        findings.append(finding("error", "research-citation", "required citation field(s) missing: " + ", ".join(missing), path=relative))
+                    else:
+                        findings.append(finding("info", "research-citation", f"citation file contains {len(required)} required field(s)", path=relative))
+                except (OSError, UnicodeError) as err:
+                    findings.append(finding("error", "research-citation", f"cannot read citation file: {err}", path=relative))
+
+    evaluation = section("evaluation")
+    if evaluation is not None:
+        results_path = evaluation.get("results")
+        if results_path is not None:
+            results, relative = _research_read_json_result(root, results_path, "evaluation.results", findings, manifest_rel)
+            if results is not None:
+                metrics = evaluation.get("metrics", {})
+                if not isinstance(metrics, dict) or not metrics:
+                    findings.append(finding("error", "research-manifest", "evaluation.metrics must be a non-empty object when results is set", path=manifest_rel))
+                else:
+                    available = results.get("metrics", results)
+                    if not isinstance(available, dict):
+                        findings.append(finding("error", "research-evaluation", "results must contain a metrics object or top-level numeric metrics", path=relative))
+                        available = {}
+                    for name, limits in metrics.items():
+                        if not isinstance(name, str) or not isinstance(limits, dict) or not limits:
+                            findings.append(finding("error", "research-manifest", "each evaluation metric must map to an object with min and/or max", path=manifest_rel))
+                            continue
+                        actual = available.get(name)
+                        if isinstance(actual, bool) or not isinstance(actual, (int, float)) or not math.isfinite(actual):
+                            findings.append(finding("error", "research-evaluation", f"metric '{name}' is missing or is not a finite number", path=relative))
+                            continue
+                        problems = []
+                        for bound in ("min", "max"):
+                            if bound in limits:
+                                limit = limits[bound]
+                                if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit):
+                                    findings.append(finding("error", "research-manifest", f"evaluation metric '{name}' {bound} must be a finite number", path=manifest_rel))
+                                    problems = None
+                                    break
+                                if bound == "min" and actual < limit:
+                                    problems.append(f"below minimum {limit}")
+                                if bound == "max" and actual > limit:
+                                    problems.append(f"above maximum {limit}")
+                        if problems is None:
+                            continue
+                        if not any(bound in limits for bound in ("min", "max")):
+                            findings.append(finding("error", "research-manifest", f"evaluation metric '{name}' needs min and/or max", path=manifest_rel))
+                        elif problems:
+                            findings.append(finding("error", "research-evaluation", f"metric '{name}' is {actual} ({'; '.join(problems)})", path=relative))
+                        else:
+                            findings.append(finding("info", "research-evaluation", f"metric '{name}' is {actual} and within declared bounds", path=relative))
+        else:
+            findings.append(finding("error", "research-manifest", "evaluation.results is required", path=manifest_rel))
+        procedure = evaluation.get("procedure")
+        if procedure is not None:
+            try:
+                full, relative = _research_path(root, procedure, "evaluation.procedure")
+                exists = os.path.isfile(full)
+                findings.append(finding("info" if exists else "error", "research-evaluation",
+                                        "evaluation procedure is present" if exists else "evaluation procedure does not exist", path=relative))
+            except ValueError as err:
+                findings.append(finding("error", "research-manifest", str(err), path=manifest_rel))
+
+    return findings
+
+
+def _research_read_json_result(root, value, label, findings, manifest_rel):
+    try:
+        result, relative = _research_read_json(root, value, label)
+        if not isinstance(result, dict):
+            findings.append(finding("error", "research-evaluation", f"{label} must contain a JSON object", path=relative))
+            return None, relative
+        return result, relative
+    except ValueError as err:
+        findings.append(finding("error", "research-evaluation", str(err), path=manifest_rel))
+        return None, None
+
+
 def read_ignore_file(top):
     """Patterns from a .preflightignore file in the repository root: one glob per line,
     blank lines and lines starting with # are skipped."""
@@ -303,7 +545,7 @@ def read_ignore_file(top):
         return []
 
 
-def run(root, history=False, pii=True, dates=True, ignore=(), now=None):
+def run(root, history=False, pii=True, dates=True, ignore=(), now=None, research_manifest=None):
     root = os.path.abspath(root)
     try:
         top = git(root, "rev-parse", "--show-toplevel").decode().strip()
@@ -314,6 +556,8 @@ def run(root, history=False, pii=True, dates=True, ignore=(), now=None):
     findings = file_findings(top, paths, pii, ignore) + hygiene_findings(top, paths)
     if history:
         findings += history_findings(top, pii, ignore)
+    if research_manifest is not None:
+        findings += research_findings(top, research_manifest)
     rows = commits(top)
     if dates:
         findings += date_findings(rows, now)
@@ -364,6 +608,8 @@ def main(argv=None):
     ap.add_argument("--history", action="store_true", help="also scan everything ever added in any commit (slower)")
     ap.add_argument("--no-pii", action="store_true", help="skip personal-data checks (emails, MAC addresses, phone numbers, IBANs, card numbers)")
     ap.add_argument("--no-dates", action="store_true", help="skip the commit date and author checks")
+    ap.add_argument("--research", action="store_true", help="check research artifacts named in .research-evidence.json")
+    ap.add_argument("--research-manifest", metavar="PATH", help="check research artifacts using this JSON manifest (also enables the check)")
     ap.add_argument("--ignore", action="append", default=[], metavar="GLOB", help="skip files matching this pattern (repeatable)")
     ap.add_argument("--fail-on", choices=["error", "warn", "never"], default="error", help="exit with status 1 at this level (default: error)")
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -375,7 +621,9 @@ def main(argv=None):
         if args.install_hook:
             print(f"installed {install_hook(args.path, args.force_hook)}")
             return 0
-        report = run(args.path, args.history, not args.no_pii, not args.no_dates, args.ignore)
+        research_manifest = args.research_manifest if args.research_manifest is not None else (".research-evidence.json" if args.research else None)
+        report = run(args.path, args.history, not args.no_pii, not args.no_dates, args.ignore,
+                     research_manifest=research_manifest)
     except PreflightError as err:
         print(f"preflight: {err}", file=sys.stderr)
         return 2
