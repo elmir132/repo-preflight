@@ -363,6 +363,57 @@ class CliTests(PreflightCase):
         self.assertEqual(subprocess.run(["sh", hook], cwd=self.repo.dir, capture_output=True).returncode, 1)
 
 
+class ResearchEvidenceTests(CliTests):
+    def test_research_manifest_valid_all_sections(self):
+        self.repo.clean_base()
+        self.repo.write("data/packets.csv", "device_id,payload\n1,abc\n2,def\n")
+        model_bytes = b"tiny-model"
+        self.repo.write("models/detector.bin", model_bytes.decode("latin1"))
+        import hashlib
+        model_sha = hashlib.sha256(model_bytes).hexdigest()
+        self.repo.write("CITATION.cff", "title: Demo\nauthors:\n  - name: Test\ndate: 2026-09-01\n")
+        self.repo.write("results/metrics.json", json.dumps({"accuracy": 0.95, "loss": 0.04}))
+        self.repo.write("scripts/eval.py", "print('eval')\n")
+        manifest = {
+            "version": 1,
+            "dataset": {"path": "data/packets.csv", "rows": 2, "columns": 2, "required_columns": ["device_id", "payload"]},
+            "model": {"path": "models/detector.bin", "max_bytes": 100, "sha256": model_sha},
+            "citation": {"path": "CITATION.cff", "required_fields": ["title", "authors", "date"]},
+            "evaluation": {"results": "results/metrics.json", "procedure": "scripts/eval.py", "metrics": {"accuracy": {"min": 0.9}, "loss": {"max": 0.1}}}
+        }
+        self.repo.write(".research-evidence.json", json.dumps(manifest))
+        self.repo.commit("add research evidence")
+        report = self.repo.report(research_manifest=".research-evidence.json")
+        errors = [f for f in report["findings"] if f["level"] == "error"]
+        self.assertEqual(errors, [])
+
+    def test_research_manifest_dataset_and_metric_failures(self):
+        self.repo.clean_base()
+        self.repo.write("data/packets.csv", "device_id,payload\n1,abc\n")
+        self.repo.write("results/metrics.json", json.dumps({"accuracy": 0.70}))
+        manifest = {
+            "version": 1,
+            "dataset": {"path": "data/packets.csv", "rows": 10, "columns": 3, "required_columns": ["device_id", "missing_col"]},
+            "evaluation": {"results": "results/metrics.json", "metrics": {"accuracy": {"min": 0.90}}}
+        }
+        self.repo.write("manifest.json", json.dumps(manifest))
+        self.repo.commit("add research manifest")
+        report = self.repo.report(research_manifest="manifest.json")
+        checks = [f["check"] for f in report["findings"] if f["level"] == "error"]
+        self.assertIn("research-dataset", checks)
+        self.assertIn("research-evaluation", checks)
+
+    def test_research_cli_flag(self):
+        self.repo.clean_base()
+        self.repo.write("CITATION.cff", "title: Demo\n")
+        manifest = {"version": 1, "citation": {"path": "CITATION.cff", "required_fields": ["title"]}}
+        self.repo.write(".research-evidence.json", json.dumps(manifest))
+        self.repo.commit("add evidence")
+        code, out, _ = self.cli(self.repo.dir, "--research")
+        self.assertEqual(code, 0)
+        self.assertIn("research-citation", out)
+
+
 class DogfoodTests(unittest.TestCase):
     def test_this_repository_has_no_errors_of_its_own(self):
         root = os.path.join(os.path.dirname(__file__), "..")
