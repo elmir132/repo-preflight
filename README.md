@@ -6,7 +6,7 @@ It never prints a full secret. A finding shows the first characters and the leng
 
 ```text
 $ preflight .
-preflight 0.1.0: /path/to/demo
+preflight 0.2.0: /path/to/demo
 5 tracked files, 3 commits
 
 ERROR risky-file    .env: an environment file with real values is tracked
@@ -29,6 +29,8 @@ python preflight.py                   # check the repository in the current fold
 python preflight.py path/to/repo
 python preflight.py --history         # also check everything ever added in any commit
 python preflight.py --json            # machine-readable report
+python preflight.py --research        # check artifacts declared in .research-evidence.json
+python preflight.py --research-manifest evidence.json path/to/repo
 python preflight.py --install-hook    # block `git push` when there is an error
 ```
 
@@ -51,6 +53,42 @@ After `pip install .` the command is called `preflight`. Exit status: 0 when not
 **Basics:** no README, LICENSE or `.gitignore` (warnings), no CI workflow (a note).
 
 Put `preflight: ignore` in a comment on a line to silence that one line, pass `--ignore 'tests/fixtures/*'` to skip files, or list the patterns, one per line, in a `.preflightignore` file at the repository root (lines starting with `#` are comments).
+
+## Research evidence mode
+
+Research checks are opt-in so ordinary repository scans keep their existing scope. Add a `.research-evidence.json` file and run `preflight --research`, or pass a custom manifest with `preflight --research-manifest path/to/evidence.json`. Manifest and artifact paths are relative to the repository root and cannot resolve outside it.
+
+The manifest can declare any combination of a dataset, model, citation and evaluation result:
+
+```json
+{
+  "version": 1,
+  "dataset": {
+    "path": "data/packets.csv",
+    "rows": 23481,
+    "columns": 14,
+    "required_columns": ["device_id", "payload"]
+  },
+  "model": {
+    "path": "models/detector.tflite",
+    "max_bytes": 5120
+  },
+  "citation": {
+    "path": "CITATION.cff",
+    "required_fields": ["title", "authors", "date"]
+  },
+  "evaluation": {
+    "results": "results/metrics.json",
+    "procedure": "scripts/evaluate.py",
+    "metrics": {
+      "accuracy": {"min": 0.9},
+      "false_positive_rate": {"max": 0.05}
+    }
+  }
+}
+```
+
+Dataset row counts exclude the header, and every CSV row must have the header's field count. Model checks can enforce a size ceiling and, optionally, a 64-character hexadecimal `sha256` digest. Citation checks confirm that required YAML-style keys are present; they do not validate citation semantics. Evaluation results must be JSON with numeric metrics either at the top level or under `metrics`; declared `min` and `max` bounds are inclusive. The optional `procedure` path is checked for existence only. Preflight never runs it, loads a model, or makes network requests. This checks that declared evidence files match simple claims in the manifest; it does not establish that a study is scientifically valid or reproduce its results.
 
 ## Pre-push hook
 

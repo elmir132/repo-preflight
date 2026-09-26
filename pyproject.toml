@@ -1,7 +1,7 @@
 [project]
 name = "repo-preflight"
-version = "0.1.0"
-description = "Check a git repository for secrets, personal data and suspicious commit dates before you publish it."
+version = "0.2.0"
+description = "Check repositories for sensitive data, suspicious commit dates, and declared research artifacts."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
